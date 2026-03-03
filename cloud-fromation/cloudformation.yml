@@ -1,0 +1,526 @@
+
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NestJS + React on EC2 + S3 + RDS (MySQL). ap-southeast-2 (Sydney).
+  Provisions: VPC, public/private subnets, EC2, Elastic IP,
+  RDS MySQL in private subnets, S3 bucket, IAM role for S3.
+
+# ── Parameters ───────────────────────────────────────────────
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: nest-demo-app
+    Description: Prefix for resource names (e.g. nest-demo-test, nest-demo-beta)
+
+  Environment:
+    Type: String
+    Default: test
+    Description: Environment name for tagging and naming (test or beta)
+    AllowedValues:
+      - test
+      - beta
+
+  KeyPairName:
+    Type: String
+    Default: nest-deploy-key
+    Description: >
+      EC2 SSH key pair name. Create it first:
+        aws ec2 create-key-pair --key-name nest-deploy-key
+          --region ap-southeast-2 --query 'KeyMaterial'
+          --output text > ~/.ssh/nest-deploy-key.pem
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: EC2 instance type
+    AllowedValues:
+      - t3.small    # $0.0208/hr — 2 vCPU, 2GB RAM
+      - t3.medium   # $0.0416/hr — 2 vCPU, 4GB RAM
+      - t3.large    # $0.0832/hr — 2 vCPU, 8GB RAM  (selected)
+      - t3.xlarge   # $0.1664/hr — 4 vCPU, 16GB RAM
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Ubuntu 22.04 LTS AMI — auto-resolved from SSM for ap-southeast-2
+
+  VolumeSize:
+    Type: Number
+    Default: 80
+    Description: Root EBS volume size in GB
+
+  AWSRegion:
+    Type: String
+    Default: ap-southeast-2
+    Description: AWS region (used in UserData and app config)
+    AllowedValues:
+      - ap-southeast-2
+
+  # RDS (MySQL) parameters
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: RDS instance class (db.t3.micro is free-tier eligible in some regions)
+    AllowedValues:
+      - db.t3.micro       # 2 vCPU, 1 GB RAM
+      - db.t3.small       # 2 vCPU, 2 GB RAM
+      - db.t3.medium      # 2 vCPU, 4 GB RAM
+
+  DBName:
+    Type: String
+    Default: nestdb
+    Description: Name of the database to create on RDS
+
+  DBMasterUsername:
+    Type: String
+    Default: admin
+    Description: RDS master username (use in app as DB_USERNAME)
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    Description: RDS master password (use in app as DB_PASSWORD). Min 8 chars.
+
+# ── Resources ─────────────────────────────────────────────────
+Resources:
+
+  # ── VPC & Networking ────────────────────────────────────────
+
+  # VPC — isolated network for your resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway — allows VPC to reach the internet
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+
+  # Attach the internet gateway to the VPC
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnet — where EC2 instance lives
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: ap-southeast-2a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-subnet"
+
+  # Route Table — routes internet traffic through the gateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-route-table"
+
+  # Default route — send all traffic (0.0.0.0/0) to internet gateway
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate subnet with route table
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private Subnets — for RDS (must be in at least 2 AZs)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: ap-southeast-2a
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-1a"
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: ap-southeast-2b
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-1b"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Private Route Table — no internet gateway (RDS doesn't need internet)
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-route-table"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Associate private subnets with private route table
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # DB Subnet Group — required for RDS (must span at least 2 AZs)
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS MySQL instance
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-db-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Security Group ───────────────────────────────────────────
+  # Controls which ports are open to the internet
+  # Port 3000 and 3306 are NOT opened — kept internal only
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH, HTTP, HTTPS traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # SSH — for deploying from your Mac
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+        # HTTP — Nginx listens here, serves frontend and proxies API
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+        # HTTPS — for SSL/domain (Let's Encrypt later)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+      SecurityGroupEgress:
+        # Allow all outbound traffic (for apt-get, Docker pulls, S3 uploads)
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS Security Group — allows EC2 to connect to RDS on port 3306
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow EC2 to connect to RDS MySQL
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # MySQL — only from EC2 security group (not from internet)
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-rds-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role for EC2 → S3 Access ────────────────────────────
+  # Allows the EC2 instance to upload/read files from the S3 bucket
+  # without needing to store AWS credentials on the server
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-s3-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow EC2 to upload, read, delete files in the media bucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt MediaBucket.Arn
+                  - !Sub "${MediaBucket.Arn}/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ec2-role"
+
+  # Instance Profile — attaches the IAM role to EC2
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-instance-profile"
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ── EC2 Instance ─────────────────────────────────────────────
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3        # General Purpose SSD — faster than gp2
+            DeleteOnTermination: true
+      # UserData runs ONCE on first boot — installs Docker, Nginx, AWS CLI
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          apt-get update -y
+          apt-get upgrade -y
+
+          # Install Docker
+          curl -fsSL https://get.docker.com | sh
+          usermod -aG docker ubuntu
+          systemctl enable docker
+          systemctl start docker
+
+          # Install Docker Compose plugin
+          apt-get install -y docker-compose-plugin
+
+          # Install Nginx
+          apt-get install -y nginx
+          systemctl enable nginx
+          systemctl start nginx
+
+          # Install AWS CLI v2 (for S3 uploads from server)
+          apt-get install -y unzip curl
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install
+          rm -rf /tmp/awscliv2.zip /tmp/aws
+
+          # Install useful tools
+          apt-get install -y wget git
+
+          # Write S3 bucket name and region to environment for the app to use
+          echo "S3_BUCKET_NAME=${MediaBucket}" >> /etc/environment
+          echo "AWS_REGION=${AWSRegion}" >> /etc/environment
+
+          echo "Bootstrap complete" > /home/ubuntu/bootstrap-done.txt
+
+      Tags:
+        - Key: Name
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Elastic IP ───────────────────────────────────────────────
+  # Permanent public IP — stays the same even after instance stop/start
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref EC2Instance
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-eip"
+
+  # ── S3 Bucket for Media Uploads ──────────────────────────────
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-media-${AWS::AccountId}"
+      # Block all public access — files served via signed URLs or CloudFront
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Versioning keeps old versions of uploaded files
+      VersioningConfiguration:
+        Status: Enabled
+      # CORS — allows your frontend/NestJS to upload directly to S3
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedOrigins:
+              - "*"    # Restrict to your domain in production e.g. https://yourdomain.com
+            MaxAge: 3000
+      # Lifecycle — auto-delete incomplete multipart uploads after 7 days
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-media"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── RDS MySQL Instance ──────────────────────────────────────
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-db"
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBName: !Ref DBName
+      AllocatedStorage: 20
+      StorageType: gp3
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-rds"
+        - Key: Environment
+          Value: !Ref Environment
+
+# ── Outputs ───────────────────────────────────────────────────
+# These values are shown after stack creation — copy them for your .env file
+Outputs:
+
+  EC2PublicIP:
+    Description: >
+      EC2 Elastic (permanent) IP address.
+      Use this in SSH and deploy commands.
+    Value: !Ref ElasticIP
+    Export:
+      Name: !Sub "${AWS::StackName}-IP"
+
+  AppUrl:
+    Description: Frontend URL (after deployment)
+    Value: !Sub "http://${ElasticIP}"
+
+  ApiUrl:
+    Description: API base URL
+    Value: !Sub "http://${ElasticIP}/api"
+
+  SwaggerUrl:
+    Description: Swagger docs URL
+    Value: !Sub "http://${ElasticIP}/api/docs"
+
+  S3BucketName:
+    Description: >
+      S3 bucket name for media uploads.
+      Add this to your .env file as S3_BUCKET_NAME.
+    Value: !Ref MediaBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3Bucket"
+
+  S3BucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt MediaBucket.Arn
+
+  EC2RoleName:
+    Description: IAM Role attached to EC2 — grants S3 access without credentials
+    Value: !Ref EC2InstanceRole
+
+  SSHCommand:
+    Description: SSH command to connect to your server
+    Value: !Sub "ssh -i ~/.ssh/nest-deploy-key.pem ubuntu@${ElasticIP}"
+
+  DeployCommand:
+    Description: Command to deploy your app
+    Value: !Sub "./deploy.sh ${ElasticIP} ~/.ssh/nest-deploy-key.pem"
+
+  RDSEndpoint:
+    Description: >
+      RDS MySQL endpoint (hostname).
+      Use this in your app as DB_HOST.
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSEndpoint"
+
+  RDSPort:
+    Description: RDS MySQL port (usually 3306)
+    Value: !GetAtt RDSInstance.Endpoint.Port
+
+  DBName:
+    Description: Database name on RDS
+    Value: !Ref DBName
+
+  DBMasterUsername:
+    Description: RDS master username (use as DB_USERNAME in app)
+    Value: !Ref DBMasterUsername
